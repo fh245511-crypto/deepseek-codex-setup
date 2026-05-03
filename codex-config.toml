@@ -1,0 +1,36 @@
+# ============================================================
+# Codex Desktop config.toml — 通过 CLIProxyAPI 接入 DeepSeek V4
+#
+# 将此文件复制到:
+#   macOS / Linux: ~/.codex/config.toml
+#   Windows:       %USERPROFILE%\.codex\config.toml
+# ============================================================
+
+# === 默认模型 (直接运行 codex 时使用) ===
+model_provider = "deepseek"
+model = "deepseek-v4-pro"
+
+# === Profiles: 通过 --profile 切换模型 ===
+[profiles.ds-pro]
+model_provider = "deepseek"
+model = "deepseek-v4-pro"
+
+[profiles.ds-flash]
+model_provider = "deepseek-flash"
+model = "deepseek-v4-flash"
+
+# === Model Providers 定义 ===
+
+[model_providers.deepseek]
+name = "DeepSeek V4 Pro"
+base_url = "http://localhost:8317/v1"
+wire_api = "responses"
+requires_openai_auth = true
+preferred_auth_method = "apikey"
+
+[model_providers.deepseek-flash]
+name = "DeepSeek V4 Flash"
+base_url = "http://localhost:8317/v1"
+wire_api = "responses"
+requires_openai_auth = true
+preferred_auth_method = "apikey"
