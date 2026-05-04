@@ -1,19 +1,17 @@
 # ============================================================
-# Codex → DeepSeek 代理配置文件
+# Codex → DeepSeek 代理配置文件 (示例)
+# 复制为 proxy-config.yaml 并填入真实密钥
 # ============================================================
 
 port: 8317
 
-# 客户端鉴权密钥 (Codex auth.json 里填的)
 api_keys:
   - "sk-cliproxyapi-my-key-2026"
 
-# DeepSeek 上游配置
 deepseek:
   base_url: "https://api.deepseek.com/v1"
-  api_key: "sk-REDACTED-ROTATE-THIS-KEY"
+  api_key: "sk-your-deepseek-api-key-here"
 
-  # Codex 内部模型名 → DeepSeek 模型名
   models:
     gpt-5.4:           deepseek-v4-pro
     gpt-5.3-codex:     deepseek-v4-pro

@@ -173,13 +173,21 @@ type RespUsage struct {
 }
 
 type RespResponse struct {
-	ID        string           `json:"id"`
-	Object    string           `json:"object"`
-	CreatedAt int64            `json:"created_at"`
-	Status    string           `json:"status"`
-	Model     string           `json:"model"`
-	Output    []RespOutputItem `json:"output"`
-	Usage     RespUsage        `json:"usage"`
+	ID                string           `json:"id"`
+	Object            string           `json:"object"`
+	CreatedAt         int64            `json:"created_at"`
+	Status            string           `json:"status"`
+	Model             string           `json:"model"`
+	Output            []RespOutputItem `json:"output"`
+	Usage             RespUsage        `json:"usage"`
+	Error             *RespError       `json:"error,omitempty"`
+	IncompleteDetails *string          `json:"incomplete_details,omitempty"`
+}
+
+type RespError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
 }
 
 // --- Chat Completions response from DeepSeek ---
@@ -396,9 +404,9 @@ func translateRequest(r *RespRequest, cfg DeepSeekConfig, lookup cacheLookupFn) 
 // ---------------------------------------------------------------------------
 
 func genID(prefix string) string {
-	var b [4]byte
+	var b [8]byte
 	rand.Read(b[:])
-	return prefix + hex.EncodeToString(b[:]) + fmt.Sprintf("%x", time.Now().UnixNano())
+	return prefix + hex.EncodeToString(b[:])
 }
 
 func translateNonStream(ccResp *CCResponse, model string) RespResponse {
@@ -477,7 +485,7 @@ func writeSSE(w http.ResponseWriter, event SSEEvent) {
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
 }
 
-func streamTranslate(w http.ResponseWriter, body io.Reader, model string, flusher http.Flusher, storeFn func(string, string)) {
+func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader, model string, flusher http.Flusher, storeFn func(string, string)) {
 	respID := genID("resp_")
 	rsID := genID("rs_")
 	msgID := genID("msg_")
@@ -548,6 +556,12 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string, flushe
 	chunkCount := 0
 
 	for scanner.Scan() {
+		// Check if client disconnected
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
@@ -773,16 +787,85 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string, flushe
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
+type cacheEntry struct {
+	reasoning string
+	callID    string
+	createdAt time.Time
+}
+
+// lruCache is a bounded LRU map for call_id → reasoning_text.
+type lruCache struct {
+	mu       sync.Mutex
+	entries  map[string]*cacheEntry
+	order    []string // oldest first
+	maxSize  int
+}
+
+func newLRUCache(maxSize int) *lruCache {
+	return &lruCache{
+		entries: make(map[string]*cacheEntry),
+		maxSize: maxSize,
+	}
+}
+
+func (c *lruCache) get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+	// Move to end (most-recently-used) by removing from order and appending
+	for i, k := range c.order {
+		if k == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+	c.order = append(c.order, key)
+	return e.reasoning, true
+}
+
+func (c *lruCache) put(key, reasoning string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[key]; exists {
+		// Update existing entry
+		c.entries[key].reasoning = reasoning
+		for i, k := range c.order {
+			if k == key {
+				c.order = append(c.order[:i], c.order[i+1:]...)
+				break
+			}
+		}
+	} else {
+		// Evict oldest if at capacity
+		for len(c.order) >= c.maxSize {
+			oldest := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, oldest)
+		}
+		c.entries[key] = &cacheEntry{reasoning: reasoning, callID: key, createdAt: time.Now()}
+	}
+	c.order = append(c.order, key)
+}
+
+func (c *lruCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.order)
+}
+
 type Server struct {
-	config         Config
-	validKeys      map[string]bool
-	deepseekURL    string
-	httpClient     *http.Client
-	logFile        *os.File
-	logger         *log.Logger
-	reasoningCache map[string]string   // call_id → reasoning_text
-	cacheMu        sync.RWMutex        // protects reasoningCache
-	cacheMaxSize   int                 // max cache entries before eviction
+	config      Config
+	validKeys   map[string]bool
+	deepseekURL string
+	httpClient  *http.Client
+	logFile     *os.File
+	logger      *log.Logger
+	cache       *lruCache
+	maxBodySize int64
+	debug       bool
 }
 
 func NewServer(cfg Config) *Server {
@@ -805,14 +888,15 @@ func NewServer(cfg Config) *Server {
 	}
 
 	return &Server{
-		config:         cfg,
-		validKeys:      keys,
-		deepseekURL:    strings.TrimRight(cfg.DeepSeek.BaseURL, "/") + "/chat/completions",
-		httpClient:     &http.Client{Timeout: 300 * time.Second},
-		logFile:        f,
-		logger:         lgr,
-		reasoningCache: make(map[string]string),
-		cacheMaxSize:   200,
+		config:      cfg,
+		validKeys:   keys,
+		deepseekURL: strings.TrimRight(cfg.DeepSeek.BaseURL, "/") + "/chat/completions",
+		httpClient:  &http.Client{Timeout: 300 * time.Second},
+		logFile:     f,
+		logger:      lgr,
+		cache:       newLRUCache(200),
+		maxBodySize: 5 << 20, // 5 MB
+		debug:       false,
 	}
 }
 
@@ -854,9 +938,9 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse
+	// Parse (with body size limit)
 	var reqBody RespRequest
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, s.maxBodySize)).Decode(&reqBody); err != nil {
 		s.log("REQ PARSE_ERROR: %v", err)
 		s.serverError(w, "bad request: "+err.Error(), 400)
 		return
@@ -873,14 +957,15 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	s.log("UPSTREAM model=%s msgs=%d tools=%d effort=%q stream=%v size=%d",
 		upstreamReq.Model, len(upstreamReq.Messages), len(upstreamReq.Tools),
 		upstreamReq.ReasoningEffort, upstreamReq.Stream, len(bodyBytes))
-	// Debug: dump upstream body on errors (truncate)
-	bodyPreview := string(bodyBytes)
-	if len(bodyPreview) > 800 {
-		bodyPreview = bodyPreview[:800] + "..."
+	if s.debug {
+		bodyPreview := string(bodyBytes)
+		if len(bodyPreview) > 500 {
+			bodyPreview = bodyPreview[:500] + "..."
+		}
+		s.log("UPSTREAM_BODY %s", bodyPreview)
 	}
-	s.log("UPSTREAM_BODY %s", bodyPreview)
 
-	httpReq, _ := http.NewRequest("POST", s.deepseekURL, bytes.NewReader(bodyBytes))
+	httpReq, _ := http.NewRequestWithContext(r.Context(), "POST", s.deepseekURL, bytes.NewReader(bodyBytes))
 	httpReq.Header.Set("Authorization", "Bearer "+s.config.DeepSeek.APIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 	if reqBody.Stream {
@@ -921,7 +1006,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 		s.log("RESP stream_start")
-		streamTranslate(w, resp.Body, reqBody.Model, flusher, s.cacheStore)
+		streamTranslate(r.Context(), w, resp.Body, reqBody.Model, flusher, s.cacheStore)
 		s.log("RESP stream_done")
 		return
 	}
@@ -953,6 +1038,9 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(translated)
 }
 
+func (s *Server) cacheLookup(callID string) (string, bool) { return s.cache.get(callID) }
+func (s *Server) cacheStore(callID, reasoning string)  { s.cache.put(callID, reasoning) }
+
 func (s *Server) saveReasoning(output []RespOutputItem) {
 	var reasoning string
 	for _, o := range output {
@@ -963,42 +1051,11 @@ func (s *Server) saveReasoning(output []RespOutputItem) {
 	if reasoning == "" {
 		return
 	}
-
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-
-	// Evict oldest entries if over max size
-	for len(s.reasoningCache) >= s.cacheMaxSize {
-		for k := range s.reasoningCache {
-			delete(s.reasoningCache, k)
-			break
-		}
-	}
-
 	for _, o := range output {
 		if o.Type == "function_call" && o.CallID != "" {
-			s.reasoningCache[o.CallID] = reasoning
+			s.cache.put(o.CallID, reasoning)
 		}
 	}
-}
-
-func (s *Server) cacheLookup(callID string) (string, bool) {
-	s.cacheMu.RLock()
-	defer s.cacheMu.RUnlock()
-	v, ok := s.reasoningCache[callID]
-	return v, ok
-}
-
-func (s *Server) cacheStore(callID, reasoning string) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	for len(s.reasoningCache) >= s.cacheMaxSize {
-		for k := range s.reasoningCache {
-			delete(s.reasoningCache, k)
-			break
-		}
-	}
-	s.reasoningCache[callID] = reasoning
 }
 
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {

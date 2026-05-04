@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.zip
+*.tar.gz
+*.dll
+*.so
+*.dylib
+
+# Secrets — NEVER commit real keys
+proxy-config.yaml
+codex-deepseek-proxy/proxy-config.yaml
+config.yaml
+*.env
+*.env.local
+*.env.production
+
+# Logs
+*.log
+*.tmp
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Build artifacts
+codex-deepseek-proxy/codex-deepseek-proxy.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
