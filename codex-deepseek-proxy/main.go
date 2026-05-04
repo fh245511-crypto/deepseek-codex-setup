@@ -408,12 +408,26 @@ func translateRequest(r *RespRequest, cfg DeepSeekConfig, lookup cacheLookupFn) 
 		},
 	}
 
+	// Reasoning effort: Codex explicit > per-model default
 	if r.Reasoning != nil && r.Reasoning.Effort != "" {
 		req.ReasoningEffort = r.Reasoning.Effort
+	} else {
+		defEffort, _ := perModelDefaults(upstreamModel)
+		if defEffort != "" {
+			req.ReasoningEffort = defEffort
+		}
 	}
+
+	// Max tokens: Codex explicit > per-model default
 	if r.MaxOutputTokens > 0 {
 		req.MaxTokens = r.MaxOutputTokens
+	} else {
+		_, defTokens := perModelDefaults(upstreamModel)
+		if defTokens > 0 {
+			req.MaxTokens = defTokens
+		}
 	}
+
 	req.Temperature = r.Temperature
 	req.TopP = r.TopP
 
@@ -1148,6 +1162,50 @@ func (s *Server) saveReasoning(output []RespOutputItem) {
 	}
 }
 
+// handleModels returns the model list that Codex Desktop can discover.
+func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
+	models := []map[string]interface{}{
+		{
+			"id": "deepseek-v4-pro", "object": "model",
+			"owned_by": "deepseek",
+			"metadata": map[string]interface{}{
+				"reasoning_effort": []string{"low", "medium", "high", "xhigh"},
+				"max_tokens":       65536,
+				"default_effort":   "xhigh",
+			},
+		},
+		{
+			"id": "deepseek-v4-flash", "object": "model",
+			"owned_by": "deepseek",
+			"metadata": map[string]interface{}{
+				"reasoning_effort": []string{"low", "medium", "high"},
+				"max_tokens":       65536,
+				"default_effort":   "medium",
+			},
+		},
+		// Aliases Codex Desktop may use internally
+		{ "id": "gpt-5.4", "object": "model", "owned_by": "deepseek" },
+		{ "id": "gpt-5.4-mini", "object": "model", "owned_by": "deepseek" },
+		{ "id": "gpt-5.3-codex", "object": "model", "owned_by": "deepseek" },
+		{ "id": "gpt-5.2", "object": "model", "owned_by": "deepseek" },
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"object": "list",
+		"data":   models,
+	})
+}
+
+// perModelDefaults returns tuned defaults based on the upstream model.
+func perModelDefaults(model string) (reasoningEffort string, maxTokens int) {
+	switch model {
+	case "deepseek-v4-flash":
+		return "medium", 4096
+	default: // deepseek-v4-pro and everything else
+		return "xhigh", 8192
+	}
+}
+
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	upstreamOK := true
 	if err := s.checkUpstream(); err != nil {
@@ -1207,6 +1265,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/responses", srv.HandleResponses)
+	mux.HandleFunc("/v1/models", srv.HandleModels)
 	mux.HandleFunc("/health", srv.HandleHealth)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
