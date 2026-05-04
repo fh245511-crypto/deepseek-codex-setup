@@ -14,13 +14,38 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
+)
+
+// ---- domain constants ----
+const (
+	typMessage            = "message"
+	typReasoning          = "reasoning"
+	typFunctionCall       = "function_call"
+	typFunctionCallOutput = "function_call_output"
+	typDeveloper          = "developer"
+	typSystem             = "system"
+	typFunction           = "function"
+	typOutputText         = "output_text"
+	typInputText          = "input_text"
+	typSummaryText        = "summary_text"
+	statusCompleted       = "completed"
+	statusInProgress      = "in_progress"
+	statusIncomplete      = "incomplete"
+
+	defaultPort       = 8317
+	defaultMaxBody    = 5 << 20
+	defaultCacheSize  = 200
+	defaultCacheTTL   = 30 * time.Minute
+	defaultHTTPTimeout = 300 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -808,14 +833,26 @@ func newLRUCache(maxSize int) *lruCache {
 	}
 }
 
+func (c *lruCache) evictExpired(now time.Time) {
+	for len(c.order) > 0 {
+		oldest := c.order[0]
+		e := c.entries[oldest]
+		if now.Sub(e.createdAt) < defaultCacheTTL {
+			break
+		}
+		c.order = c.order[1:]
+		delete(c.entries, oldest)
+	}
+}
+
 func (c *lruCache) get(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.evictExpired(time.Now())
 	e, ok := c.entries[key]
 	if !ok {
 		return "", false
 	}
-	// Move to end (most-recently-used) by removing from order and appending
 	for i, k := range c.order {
 		if k == key {
 			c.order = append(c.order[:i], c.order[i+1:]...)
@@ -829,9 +866,11 @@ func (c *lruCache) get(key string) (string, bool) {
 func (c *lruCache) put(key, reasoning string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
+	c.evictExpired(now)
 	if _, exists := c.entries[key]; exists {
-		// Update existing entry
 		c.entries[key].reasoning = reasoning
+		c.entries[key].createdAt = now
 		for i, k := range c.order {
 			if k == key {
 				c.order = append(c.order[:i], c.order[i+1:]...)
@@ -839,18 +878,17 @@ func (c *lruCache) put(key, reasoning string) {
 			}
 		}
 	} else {
-		// Evict oldest if at capacity
 		for len(c.order) >= c.maxSize {
 			oldest := c.order[0]
 			c.order = c.order[1:]
 			delete(c.entries, oldest)
 		}
-		c.entries[key] = &cacheEntry{reasoning: reasoning, callID: key, createdAt: time.Now()}
+		c.entries[key] = &cacheEntry{reasoning: reasoning, callID: key, createdAt: now}
 	}
 	c.order = append(c.order, key)
 }
 
-func (c *lruCache) len() int {
+func (c *lruCache) stats() (size int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.order)
@@ -866,19 +904,34 @@ type Server struct {
 	cache       *lruCache
 	maxBodySize int64
 	debug       bool
+	startTime   time.Time
+	// metrics
+	reqTotal    atomic.Int64
+	reqErrors   atomic.Int64
+	streamTotal atomic.Int64
+	cacheHits   atomic.Int64
+	cacheMisses atomic.Int64
 }
 
 func NewServer(cfg Config) *Server {
+	// Env var override for API key (safer than config file)
+	if envKey := os.Getenv("DEEPSEEK_API_KEY"); envKey != "" {
+		cfg.DeepSeek.APIKey = envKey
+	}
+	if envPort := os.Getenv("PROXY_PORT"); envPort != "" {
+		fmt.Sscanf(envPort, "%d", &cfg.Port)
+	}
+
 	keys := make(map[string]bool)
 	for _, k := range cfg.APIKeys {
 		keys[k] = true
 	}
 
-	// Open request log file
-	logPath := "proxy-requests.log"
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	// Daily rotating log file
+	logName := fmt.Sprintf("proxy-%s.log", time.Now().Format("2006-01-02"))
+	f, err := os.OpenFile(logName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("[WARN] 无法创建日志文件 %s，使用 stdout: %v", logPath, err)
+		log.Printf("[WARN] cannot create log %s: %v", logName, err)
 		f = nil
 	}
 
@@ -887,17 +940,45 @@ func NewServer(cfg Config) *Server {
 		lgr = log.New(f, "", log.LstdFlags)
 	}
 
-	return &Server{
+	srv := &Server{
 		config:      cfg,
 		validKeys:   keys,
 		deepseekURL: strings.TrimRight(cfg.DeepSeek.BaseURL, "/") + "/chat/completions",
-		httpClient:  &http.Client{Timeout: 300 * time.Second},
+		httpClient: &http.Client{
+			Timeout: defaultHTTPTimeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        20,
+				IdleConnTimeout:     90 * time.Second,
+				MaxConnsPerHost:     10,
+				DisableCompression:  false,
+			},
+		},
 		logFile:     f,
 		logger:      lgr,
-		cache:       newLRUCache(200),
-		maxBodySize: 5 << 20, // 5 MB
-		debug:       false,
+		cache:       newLRUCache(defaultCacheSize),
+		maxBodySize: defaultMaxBody,
+		debug:       os.Getenv("PROXY_DEBUG") == "1",
+		startTime:   time.Now(),
 	}
+	return srv
+}
+
+// checkUpstream pings DeepSeek API on startup to catch config errors early.
+func (s *Server) checkUpstream() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		strings.TrimRight(s.config.DeepSeek.BaseURL, "/")+"/models", nil)
+	req.Header.Set("Authorization", "Bearer "+s.config.DeepSeek.APIKey)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("upstream unreachable: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("upstream returned %d (check API key)", resp.StatusCode)
+	}
+	return nil
 }
 
 func (s *Server) log(format string, v ...interface{}) {
@@ -925,7 +1006,9 @@ func (s *Server) serverError(w http.ResponseWriter, msg string, code int) {
 }
 
 func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	s.reqTotal.Add(1)
 	if r.Method != http.MethodPost {
+		s.reqErrors.Add(1)
 		s.serverError(w, "method not allowed", 405)
 		return
 	}
@@ -933,6 +1016,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	// Auth
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !s.validKeys[token] {
+		s.reqErrors.Add(1)
 		s.log("REQ AUTH_FAIL")
 		s.authError(w)
 		return
@@ -941,6 +1025,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	// Parse (with body size limit)
 	var reqBody RespRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, s.maxBodySize)).Decode(&reqBody); err != nil {
+		s.reqErrors.Add(1)
 		s.log("REQ PARSE_ERROR: %v", err)
 		s.serverError(w, "bad request: "+err.Error(), 400)
 		return
@@ -974,6 +1059,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.httpClient.Do(httpReq)
 	if err != nil {
+		s.reqErrors.Add(1)
 		s.log("UPSTREAM_ERR: %v", err)
 		s.serverError(w, "upstream request failed: "+err.Error(), 502)
 		return
@@ -1005,7 +1091,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
-		s.log("RESP stream_start")
+		s.streamTotal.Add(1); s.log("RESP stream_start")
 		streamTranslate(r.Context(), w, resp.Body, reqBody.Model, flusher, s.cacheStore)
 		s.log("RESP stream_done")
 		return
@@ -1038,8 +1124,12 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(translated)
 }
 
-func (s *Server) cacheLookup(callID string) (string, bool) { return s.cache.get(callID) }
-func (s *Server) cacheStore(callID, reasoning string)  { s.cache.put(callID, reasoning) }
+func (s *Server) cacheLookup(callID string) (string, bool) {
+	v, ok := s.cache.get(callID)
+	if ok { s.cacheHits.Add(1) } else { s.cacheMisses.Add(1) }
+	return v, ok
+}
+func (s *Server) cacheStore(callID, reasoning string) { s.cache.put(callID, reasoning) }
 
 func (s *Server) saveReasoning(output []RespOutputItem) {
 	var reasoning string
@@ -1059,8 +1149,24 @@ func (s *Server) saveReasoning(output []RespOutputItem) {
 }
 
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	upstreamOK := true
+	if err := s.checkUpstream(); err != nil {
+		upstreamOK = false
+	}
+	resp := map[string]interface{}{
+		"status":       "ok",
+		"uptime_sec":   int(time.Since(s.startTime).Seconds()),
+		"cache_size":   s.cache.stats(),
+		"req_total":    s.reqTotal.Load(),
+		"req_errors":   s.reqErrors.Load(),
+		"stream_total": s.streamTotal.Load(),
+		"cache_hits":   s.cacheHits.Load(),
+		"cache_misses": s.cacheMisses.Load(),
+		"upstream_ok":  upstreamOK,
+		"go_version":   runtime.Version(),
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1195,15 @@ func main() {
 	}
 
 	srv := NewServer(cfg)
+
+	// Startup upstream connectivity check
+	log.Printf("checking upstream connectivity...")
+	if err := srv.checkUpstream(); err != nil {
+		log.Printf("[WARN] upstream check failed: %v (proxy will still start)", err)
+	} else {
+		log.Printf("[OK] upstream reachable")
+	}
+	log.Printf("cache capacity: %d, TTL: %v", defaultCacheSize, defaultCacheTTL)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/responses", srv.HandleResponses)
