@@ -817,14 +817,18 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 	}
 
 	status := "completed"
+	var incompleteDetails *string
 	if scanErr != nil {
 		status = "incomplete"
+		detail := scanErr.Error()
+		incompleteDetails = &detail
 	}
 	writeSSE(w, SSEEvent{
 		Type: "response.completed",
 		Response: RespResponse{
 			ID: respID, Object: "response", CreatedAt: now,
 			Status: status, Model: model, Output: output, Usage: u,
+				IncompleteDetails: incompleteDetails,
 		},
 	})
 	// Responses API does not use [DONE] �?response.completed is the terminal event
@@ -984,8 +988,9 @@ func NewServer(cfg Config) *Server {
 func (s *Server) checkUpstream() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET",
+	req, err := http.NewRequestWithContext(ctx, "GET",
 		strings.TrimRight(s.config.DeepSeek.BaseURL, "/")+"/models", nil)
+	if err != nil { return fmt.Errorf("upstream unreachable: %w", err) }
 	req.Header.Set("Authorization", "Bearer "+s.config.DeepSeek.APIKey)
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -1010,7 +1015,7 @@ func (s *Server) authError(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(401)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"error": map[string]string{"message": "invalid api key", "type": "auth_error"},
+		"error": RespError{Message: "invalid api key", Type: "auth_error"},
 	})
 }
 
@@ -1018,7 +1023,7 @@ func (s *Server) serverError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"error": map[string]string{"message": msg, "type": "server_error"},
+		"error": RespError{Message: msg, Type: "server_error"},
 	})
 }
 
