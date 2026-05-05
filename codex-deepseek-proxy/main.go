@@ -27,19 +27,6 @@ import (
 
 // ---- domain constants ----
 const (
-	typMessage            = "message"
-	typReasoning          = "reasoning"
-	typFunctionCall       = "function_call"
-	typFunctionCallOutput = "function_call_output"
-	typDeveloper          = "developer"
-	typSystem             = "system"
-	typFunction           = "function"
-	typOutputText         = "output_text"
-	typInputText          = "input_text"
-	typSummaryText        = "summary_text"
-	statusCompleted       = "completed"
-	statusInProgress      = "in_progress"
-	statusIncomplete      = "incomplete"
 
 	defaultPort       = 8317
 	defaultMaxBody    = 5 << 20
@@ -85,8 +72,27 @@ type RespInputItem struct {
 	CallID           string              `json:"call_id,omitempty"`
 	Name             string              `json:"name,omitempty"`
 	Arguments        string              `json:"arguments,omitempty"`
-	Output           string              `json:"output,omitempty"`
+	Output           interface{}         `json:"output,omitempty"`
 	Reasoning        *RespReasoning      `json:"reasoning,omitempty"`
+}
+
+// flattenOutput converts Output (string or array) to a plain string.
+func flattenOutput(v interface{}) string {
+	if v == nil { return "" }
+	switch val := v.(type) {
+	case string:
+		return val
+	case []interface{}:
+		var parts []string
+		for _, e := range val {
+			if s, ok := e.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // Responses API tools: name/description/parameters at top level
@@ -361,7 +367,7 @@ func translateMessages(r *RespRequest, lookup cacheLookupFn) []CCMessage {
 			msgs = append(msgs, CCMessage{
 				Role:       "tool",
 				ToolCallID: item.CallID,
-				Content:    item.Output,
+				Content:    flattenOutput(item.Output),
 			})
 		}
 	}
@@ -909,6 +915,8 @@ func (c *lruCache) stats() (size int) {
 }
 
 type Server struct {
+	lastUpstreamCheck time.Time
+	lastUpstreamOK    bool
 	config      Config
 	validKeys   map[string]bool
 	deepseekURL string
@@ -1064,7 +1072,13 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		s.log("UPSTREAM_BODY %s", bodyPreview)
 	}
 
-	httpReq, _ := http.NewRequestWithContext(r.Context(), "POST", s.deepseekURL, bytes.NewReader(bodyBytes))
+	httpReq, err := http.NewRequestWithContext(r.Context(), "POST", s.deepseekURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			s.reqErrors.Add(1)
+			s.log("UPSTREAM_REQ_ERR: %v", err)
+			s.serverError(w, "upstream request error", 500)
+			return
+		}
 	httpReq.Header.Set("Authorization", "Bearer "+s.config.DeepSeek.APIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 	if reqBody.Stream {
@@ -1207,9 +1221,11 @@ func perModelDefaults(model string) (reasoningEffort string, maxTokens int) {
 }
 
 func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	upstreamOK := true
-	if err := s.checkUpstream(); err != nil {
-		upstreamOK = false
+	upstreamOK := s.lastUpstreamOK
+	if time.Since(s.lastUpstreamCheck) > 30*time.Second {
+		s.lastUpstreamOK = s.checkUpstream() == nil
+		s.lastUpstreamCheck = time.Now()
+		upstreamOK = s.lastUpstreamOK
 	}
 	resp := map[string]interface{}{
 		"status":       "ok",
@@ -1263,10 +1279,27 @@ func main() {
 	}
 	log.Printf("cache capacity: %d, TTL: %v", defaultCacheSize, defaultCacheTTL)
 
+	// Panic recovery middleware — prevents a single crash from killing the server
+	recovery := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[PANIC] %v — request recovered", rec)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(500)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"error": map[string]string{"message": "internal server error", "type": "server_error"},
+					})
+				}
+			}()
+			next(w, r)
+		}
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/responses", srv.HandleResponses)
-	mux.HandleFunc("/v1/models", srv.HandleModels)
-	mux.HandleFunc("/health", srv.HandleHealth)
+	mux.HandleFunc("/v1/responses", recovery(srv.HandleResponses))
+	mux.HandleFunc("/v1/models", recovery(srv.HandleModels))
+	mux.HandleFunc("/health", recovery(srv.HandleHealth))
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 
@@ -1274,7 +1307,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	httpServer := &http.Server{Addr: addr, Handler: mux}
+	httpServer := &http.Server{Addr: addr, Handler: mux, ReadTimeout: 30 * time.Second, WriteTimeout: 300 * time.Second, IdleTimeout: 120 * time.Second}
 
 	go func() {
 		<-sigCh
