@@ -29,7 +29,6 @@ import (
 
 // ---- domain constants ----
 const (
-
 	defaultPort       = 8317
 	defaultMaxBody    = 5 << 20
 	defaultCacheSize  = 200
