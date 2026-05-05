@@ -6,7 +6,7 @@
 *.so
 *.dylib
 
-# Secrets â€” NEVER commit real keys
+# Secrets ¡ª NEVER commit real keys
 proxy-config.yaml
 codex-deepseek-proxy/proxy-config.yaml
 config.yaml
@@ -21,12 +21,10 @@ config.yaml
 *.sqlite-wal
 *.sqlite-shm
 
-# Build artifacts
-codex-deepseek-proxy/codex-deepseek-proxy.exe
-
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 

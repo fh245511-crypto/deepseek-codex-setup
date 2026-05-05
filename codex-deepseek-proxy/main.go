@@ -1,10 +1,12 @@
-package main
+﻿package main
 
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -55,7 +57,7 @@ type Config struct {
 // OpenAI API types (subset)
 // ---------------------------------------------------------------------------
 
-// --- Responses API (Codex Desktop → us) ---
+// --- Responses API (Codex Desktop �?us) ---
 
 type RespContentPart struct {
 	Type string `json:"type"`
@@ -98,7 +100,7 @@ func flattenOutput(v interface{}) string {
 }
 
 // Responses API tools: name/description/parameters at top level
-// Chat Completions tools: nested under "function" key — we convert in translateTools
+// Chat Completions tools: nested under "function" key �?we convert in translateTools
 type RespTool struct {
 	Type        string      `json:"type"`
 	Name        string      `json:"name"`
@@ -122,7 +124,7 @@ type RespRequest struct {
 	Stream          bool            `json:"stream"`
 }
 
-// --- Chat Completions API (us → DeepSeek) ---
+// --- Chat Completions API (us �?DeepSeek) ---
 
 type CCToolCallFunction struct {
 	Name      string `json:"name"`
@@ -179,7 +181,7 @@ type ThinkingConfig struct {
 	Type string `json:"type"`
 }
 
-// --- Responses API output (us → Codex Desktop) ---
+// --- Responses API output (us �?Codex Desktop) ---
 
 type RespOutputSummary struct {
 	Type string `json:"type"`
@@ -577,7 +579,7 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 		}
 	}
 
-	// 1) response.created — include key request fields Codex expects
+	// 1) response.created �?include key request fields Codex expects
 	writeSSE(w, SSEEvent{
 		Type: "response.created",
 		Response: map[string]interface{}{
@@ -599,7 +601,7 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 	flusher.Flush()
 
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	chunkCount := 0
 
 	for scanner.Scan() {
@@ -805,7 +807,7 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 	log.Printf("[STREAM_DONE] chunks=%d reasoning=%d content=%d tool_calls=%d",
 		chunkCount, reasoningBuf.Len(), contentBuf.Len(), len(toolCallStates))
 
-	// Save reasoning → call_id for next turn (agent loop)
+	// Save reasoning �?call_id for next turn (agent loop)
 	if reasoningBuf.Len() > 0 && storeFn != nil {
 		for _, idx := range indices {
 			tc := toolCallStates[idx]
@@ -826,7 +828,7 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 			Status: status, Model: model, Output: output, Usage: u,
 		},
 	})
-	// Responses API does not use [DONE] — response.completed is the terminal event
+	// Responses API does not use [DONE] �?response.completed is the terminal event
 	flusher.Flush()
 }
 
@@ -834,36 +836,36 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-type cacheEntry struct {
-	reasoning string
-	callID    string
-	createdAt time.Time
+// lruCache is a bounded LRU map for call_id �?reasoning_text.
+type lruCache struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element
+	order   *list.List // oldest at front
+	maxSize int
 }
 
-// lruCache is a bounded LRU map for call_id → reasoning_text.
-type lruCache struct {
-	mu       sync.Mutex
-	entries  map[string]*cacheEntry
-	order    []string // oldest first
-	maxSize  int
+type lruItem struct {
+	key       string
+	reasoning string
+	createdAt time.Time
 }
 
 func newLRUCache(maxSize int) *lruCache {
 	return &lruCache{
-		entries: make(map[string]*cacheEntry),
+		entries: make(map[string]*list.Element),
+		order:   list.New(),
 		maxSize: maxSize,
 	}
 }
 
 func (c *lruCache) evictExpired(now time.Time) {
-	for len(c.order) > 0 {
-		oldest := c.order[0]
-		e := c.entries[oldest]
-		if now.Sub(e.createdAt) < defaultCacheTTL {
+	for e := c.order.Front(); e != nil; e = c.order.Front() {
+		item := e.Value.(*lruItem)
+		if now.Sub(item.createdAt) < defaultCacheTTL {
 			break
 		}
-		c.order = c.order[1:]
-		delete(c.entries, oldest)
+		c.order.Remove(e)
+		delete(c.entries, item.key)
 	}
 }
 
@@ -875,14 +877,8 @@ func (c *lruCache) get(key string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	for i, k := range c.order {
-		if k == key {
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			break
-		}
-	}
-	c.order = append(c.order, key)
-	return e.reasoning, true
+	c.order.MoveToBack(e)
+	return e.Value.(*lruItem).reasoning, true
 }
 
 func (c *lruCache) put(key, reasoning string) {
@@ -890,32 +886,30 @@ func (c *lruCache) put(key, reasoning string) {
 	defer c.mu.Unlock()
 	now := time.Now()
 	c.evictExpired(now)
-	if _, exists := c.entries[key]; exists {
-		c.entries[key].reasoning = reasoning
-		c.entries[key].createdAt = now
-		for i, k := range c.order {
-			if k == key {
-				c.order = append(c.order[:i], c.order[i+1:]...)
-				break
+	if e, exists := c.entries[key]; exists {
+		item := e.Value.(*lruItem)
+		item.reasoning = reasoning
+		item.createdAt = now
+		c.order.MoveToBack(e)
+	} else {
+		for c.order.Len() >= c.maxSize {
+			oldest := c.order.Front()
+			if oldest != nil {
+				oldItem := oldest.Value.(*lruItem)
+				c.order.Remove(oldest)
+				delete(c.entries, oldItem.key)
 			}
 		}
-	} else {
-		for len(c.order) >= c.maxSize {
-			oldest := c.order[0]
-			c.order = c.order[1:]
-			delete(c.entries, oldest)
-		}
-		c.entries[key] = &cacheEntry{reasoning: reasoning, callID: key, createdAt: now}
+		item := &lruItem{key: key, reasoning: reasoning, createdAt: now}
+		c.entries[key] = c.order.PushBack(item)
 	}
-	c.order = append(c.order, key)
 }
 
 func (c *lruCache) stats() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.order)
+	return c.order.Len()
 }
-
 type Server struct {
 	lastUpstreamCheck time.Time
 	lastUpstreamOK    bool
@@ -1039,7 +1033,14 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// Auth
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !s.validKeys[token] {
+	var authorized bool
+	for k := range s.validKeys {
+		if subtle.ConstantTimeCompare([]byte(k), []byte(token)) == 1 {
+			authorized = true
+			break
+		}
+	}
+	if !authorized {
 		s.reqErrors.Add(1)
 		s.log("REQ AUTH_FAIL")
 		s.authError(w)
@@ -1280,12 +1281,12 @@ func main() {
 	}
 	log.Printf("cache capacity: %d, TTL: %v", defaultCacheSize, defaultCacheTTL)
 
-	// Panic recovery middleware — prevents a single crash from killing the server
+	// Panic recovery middleware �?prevents a single crash from killing the server
 	recovery := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Printf("[PANIC] %v — request recovered", rec)
+					log.Printf("[PANIC] %v �?request recovered", rec)
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(500)
 					json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1319,10 +1320,10 @@ func main() {
 		if srv.logFile != nil { srv.logFile.Close() }
 	}()
 
-	log.Printf("Codex → DeepSeek 代理启动: http://%s", addr)
+	log.Printf("Codex �?DeepSeek 代理启动: http://%s", addr)
 	log.Printf("  上游: %s", srv.deepseekURL)
 	log.Printf("  模型映射: %v", cfg.DeepSeek.Models)
-	log.Printf("  推理强度: 直接透传 (xhigh/max 由 DeepSeek Chat Completions 原生支持)")
+	log.Printf("  推理强度: 直接透传 (xhigh/max �?DeepSeek Chat Completions 原生支持)")
 
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("服务异常: %v", err)
