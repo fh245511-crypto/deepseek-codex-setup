@@ -836,12 +836,6 @@ func streamTranslate(ctx context.Context, w http.ResponseWriter, body io.Reader,
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-type cacheEntry struct {
-	reasoning string
-	callID    string
-	createdAt time.Time
-}
-
 // lruCache is a bounded LRU map for call_id �?reasoning_text.
 type lruCache struct {
 	mu      sync.Mutex
