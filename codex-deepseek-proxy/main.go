@@ -82,8 +82,10 @@ func flattenOutput(v interface{}) string {
 	switch val := v.(type) {
 	case string:
 		return val
-	case []interface{}:
-		var parts []string
+	case []string:
+			return strings.Join(val, "\n")
+		case []interface{}:
+			var parts []string
 		for _, e := range val {
 			if s, ok := e.(string); ok {
 				parts = append(parts, s)
@@ -908,7 +910,7 @@ func (c *lruCache) put(key, reasoning string) {
 	c.order = append(c.order, key)
 }
 
-func (c *lruCache) stats() (size int) {
+func (c *lruCache) stats() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.order)
@@ -1164,13 +1166,7 @@ func (s *Server) saveReasoning(output []RespOutputItem) {
 	for _, o := range output {
 		if o.Type == "reasoning" && len(o.Summary) > 0 {
 			reasoning = o.Summary[0].Text
-		}
-	}
-	if reasoning == "" {
-		return
-	}
-	for _, o := range output {
-		if o.Type == "function_call" && o.CallID != "" {
+		} else if o.Type == "function_call" && reasoning != "" && o.CallID != "" {
 			s.cache.put(o.CallID, reasoning)
 		}
 	}
@@ -1241,6 +1237,11 @@ func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n { return s }
+	return s[:n] + "..."
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1316,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		httpServer.Shutdown(ctx)
+		if srv.logFile != nil { srv.logFile.Close() }
 	}()
 
 	log.Printf("Codex → DeepSeek 代理启动: http://%s", addr)
@@ -1325,8 +1327,4 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("服务异常: %v", err)
 	}
-}
-func truncate(s string, n int) string {
-	if len(s) <= n { return s }
-	return s[:n] + "..."
 }
