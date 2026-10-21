@@ -1,90 +1,64 @@
-# DeepSeek V4 + Codex Desktop -- Go Proxy
+# Codex–DeepSeek local protocol adapter
 
-Let Codex Desktop use DeepSeek V4 models via a local Go proxy.
-The proxy translates OpenAI Responses API calls to DeepSeek Chat Completions API in real time,
-solving the compatibility issue introduced in Codex v0.80+.
+A small Go proxy that translates a subset of OpenAI Responses requests into DeepSeek Chat Completions requests, with configuration examples for Codex clients. This is an independent community project, not an official OpenAI or DeepSeek integration.
 
-## Architecture
+## What the source implements
 
-```
-Codex Desktop --(Responses API)--> Go Proxy (localhost:8317) --(Chat API)--> DeepSeek V4
-```
+- A loopback HTTP server with `/v1/responses`, `/v1/models`, and `/health` routes.
+- Model alias mapping, developer-to-system role conversion, and function-tool conversion.
+- Streaming and non-streaming response translation.
+- An in-memory reasoning cache keyed by tool call ID, with capacity and expiry logic.
+- Local bearer-key checks for response requests, an upstream API-key environment override, and shutdown handling.
 
-## Quick Start
+These are implementation descriptions, not a claim of complete Responses API compatibility. The model IDs in the examples are project configuration values, not independent verification of upstream availability or capabilities. A tested Codex/client/model/version matrix is still needed.
 
-### 1. Configure the proxy
+## Intended use and limits
 
-Copy the example config and fill in your DeepSeek API Key:
+The adapter is intended for local experimentation with text and function-tool workflows. It does not implement the complete Responses API. The request schema expects an array of input items, and message conversion currently reads `input_text` parts only. Do not assume images, audio, built-in tools, encrypted reasoning, or persisted response retrieval are supported.
 
-```bash
-cp proxy-config.example.yaml proxy-config.yaml
-```
+The server binds to `127.0.0.1`. Do not expose it to other users or the Internet. Requests can contain source code, tool outputs, and private information; these are sent to the configured upstream provider. Use only data you are authorized to share with that provider.
 
-Edit `proxy-config.yaml`: set `deepseek.api_key` to your real key
-(from https://platform.deepseek.com/api_keys).
+## Manual setup
 
-### 2. Build and start the proxy
+Requirements: a Go toolchain satisfying `go.mod` (Go 1.23.4 or newer), a Codex client whose provider configuration you have checked, and an upstream account/API key.
 
-```bash
+1. Copy `proxy-config.example.yaml` to `proxy-config.yaml`.
+2. Set the upstream base URL and model mappings to values actually available to your account. Set `DEEPSEEK_API_KEY` in your local process environment, or fill the untracked config locally. Never put a real key in an issue, commit, screenshot, or chat.
+3. Replace the sample local proxy bearer key with a unique local value; the Codex client credential must match it. This is separate from the upstream DeepSeek key.
+4. Build and run from the repository root:
+
+```sh
 cd codex-deepseek-proxy
-go build -o codex-deepseek-proxy.exe .
-./codex-deepseek-proxy.exe --config ../proxy-config.yaml
+go build -o proxy .
+./proxy --config ../proxy-config.yaml
 ```
 
-The proxy listens on `http://localhost:8317` by default.
+On Windows use `go build -o proxy.exe .` and `.\proxy.exe --config ..\proxy-config.yaml`.
 
-### 3. Configure Codex Desktop
+5. Back up your existing Codex configuration and authentication files. Review and merge the relevant settings from `codex-config.toml`; do not blindly overwrite an existing setup. The example endpoint is `http://localhost:8317/v1`. Review authentication handling for your installed client before using the sample `codex-auth.json`.
+6. Restart the client and perform a minimal test with non-sensitive input. Record the exact client version, model ID, OS, and result when reporting compatibility.
 
-Copy `codex-config.toml` to the Codex config directory:
+**`setup.bat` is retired.** It exits without modifying files and directs users to this manual flow. The prior installer referenced a removed `config.yaml` and overwrote existing Codex files; it must not be used.
 
-- **Windows:** `%USERPROFILE%\.codex\config.toml`
-- **macOS/Linux:** `~/.codex/config.toml`
+## Checks
 
-Copy `codex-auth.json` to:
-- **Windows:** `%USERPROFILE%\.codex\auth.json`
-- **macOS/Linux:** `~/.codex/auth.json`
-
-> The key in `auth.json` must match one of the `api_keys` values in `proxy-config.yaml`
-> (default: `sk-cliproxyapi-my-key-2026`).
-
-### 4. Launch Codex
-
-```bash
-codex                          # Default: DeepSeek V4 Pro
-codex --profile ds-pro         # Force V4 Pro
-codex --profile ds-flash       # Use V4 Flash
+```sh
+cd codex-deepseek-proxy
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
-## Features
+There are currently no automated tests in this repository. The commands above are the intended development checks, not evidence of test coverage or successful execution. Regression tests and end-to-end compatibility checks remain planned work. See [verification notes](docs/VERIFICATION.md) for what has and has not been run.
 
-- **Dual model support:** `deepseek-v4-pro` (xhigh) and `deepseek-v4-flash` (medium)
-- **Reasoning effort passthrough:** xhigh / high / medium / low fully supported
-- **Reasoning cache:** call_id -> reasoning_text in-memory map for multi-turn conversations
-- **Tool call merging:** consecutive function_calls merged into a single assistant message
-- **Complete SSE event chain:** reasoning_text.delta -> output_text.delta -> function_call_arguments.delta
-- **Graceful shutdown:** SIGINT/SIGTERM triggers 10s drain
-- **Health check:** `/health` endpoint with upstream connectivity probe and cache/request metrics
+## Security and known issues
 
-## Files
+Do not use the public example credential unchanged. Leave `PROXY_DEBUG` unset for sensitive work: debug logging includes request content. Logs and cached reasoning may contain private information.
 
-| File | Purpose |
-|------|---------|
-| `codex-deepseek-proxy/main.go` | Go proxy source (single file, ~1300 lines) |
-| `proxy-config.example.yaml` | Proxy config example |
-| `codex-config.toml` | Codex client config example |
-| `codex-auth.json` | Codex auth config example |
-| `setup.bat` | Windows quick-deploy script |
+A historical commit message records removal of a real API key. Removing a file does not revoke credentials or remove historical exposure. The owner must confirm the old key was revoked or rotated; do not copy it into reports.
 
-## FAQ
+Current review items include cache expiry after LRU reordering, synchronization of health-check state, and the `PROXY_PORT` override not feeding the final listener address. Use the YAML `port` or `--port` argument, and check the startup address. See [maintenance plan](docs/MAINTENANCE.md).
 
-**Q: "insufficient tool messages" error on startup**
-A: You are connecting directly to DeepSeek instead of the proxy. Ensure `base_url` in
-`codex-config.toml` points to `http://localhost:8317/v1`.
+## Contributing and licensing
 
-**Q: Port already in use**
-A: Change `port` in `proxy-config.yaml` and update all `base_url` values in
-`codex-config.toml` accordingly.
-
-**Q: Codex reports authentication failure**
-A: Verify `OPENAI_API_KEY` in `codex-auth.json` matches one of the `api_keys`
-in `proxy-config.yaml`.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The original project code is available under the [MIT License](LICENSE). Third-party dependencies retain their own terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [provenance notes](docs/PROVENANCE.md).
